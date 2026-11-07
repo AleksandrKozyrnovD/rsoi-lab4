@@ -1,0 +1,55 @@
+version: "3"
+services:
+  postgres:
+    image: library/postgres:13
+    container_name: postgres
+    restart: on-failure
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./postgres/:/docker-entrypoint-initdb.d/
+    ports:
+      - "5432:5432"
+
+  loyalty-service:
+    build: ./project/loyalty-service/
+    container_name: loyalty-service
+    ports:
+      - "8050:8050"
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  payment-service:
+    build: ./project/payment-service/
+    container_name: payment-service
+    ports:
+      - "8060:8060"
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  reservation-service:
+    build: ./project/reservation-service/
+    container_name: reservation-service
+    ports:
+      - "8070:8070"
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  gateway-service:
+    build: ./project/gateway/
+    container_name: gateway-service
+    ports:
+      - "8080:8080"
+    depends_on:
+      - loyalty-service
+      - payment-service
+      - reservation-service
+    restart: on-failure
+volumes:
+  db-data:
