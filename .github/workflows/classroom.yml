@@ -57,6 +57,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and publish gateway image
+        id: gateway_image
         timeout-minutes: 10
         if: github.event_name == 'push'
         uses: docker/build-push-action@v6
@@ -66,6 +67,7 @@ jobs:
           tags: tsardrobovik/gateway-service:4
 
       - name: Build and publish loyalty image
+        id: loyalty_image
         timeout-minutes: 10
         if: github.event_name == 'push'
         uses: docker/build-push-action@v6
@@ -75,6 +77,7 @@ jobs:
           tags: tsardrobovik/loyalty-service:4
 
       - name: Build and publish payment image
+        id: payment_image
         timeout-minutes: 10
         if: github.event_name == 'push'
         uses: docker/build-push-action@v6
@@ -84,6 +87,7 @@ jobs:
           tags: tsardrobovik/payment-service:4
 
       - name: Build and publish reservation image
+        id: reservation_image
         timeout-minutes: 10
         if: github.event_name == 'push'
         uses: docker/build-push-action@v6
@@ -186,15 +190,29 @@ jobs:
 
       - name: Deploy services
         if: github.event_name == 'push'
-        timeout-minutes: 12
+        timeout-minutes: 30
+        env:
+          GATEWAY_DIGEST: ${{ steps.gateway_image.outputs.digest }}
+          LOYALTY_DIGEST: ${{ steps.loyalty_image.outputs.digest }}
+          PAYMENT_DIGEST: ${{ steps.payment_image.outputs.digest }}
+          RESERVATION_DIGEST: ${{ steps.reservation_image.outputs.digest }}
         run: |
+          : "${GATEWAY_DIGEST:?Gateway image digest is missing}"
+          : "${LOYALTY_DIGEST:?Loyalty image digest is missing}"
+          : "${PAYMENT_DIGEST:?Payment image digest is missing}"
+          : "${RESERVATION_DIGEST:?Reservation image digest is missing}"
+          # Keep publishing :4, but deploy immutable digests. Cached images can be
+          # reused during retries and failover tests without contacting Docker Hub.
           helm upgrade --install services ./k8s/services -n "$NAMESPACE" \
-            -f "$RUNNER_TEMP/yc/database-values.yaml" --set imagePullPolicy=Always \
-            --wait --atomic --timeout 7m
-          # The tag stays :4; restart even when the rendered Deployment did not change.
-          kubectl rollout restart deployment -n "$NAMESPACE" -l app.kubernetes.io/instance=services
+            -f "$RUNNER_TEMP/yc/database-values.yaml" --set imagePullPolicy=IfNotPresent \
+            --set-string "services.gateway.image=tsardrobovik/gateway-service:4@$GATEWAY_DIGEST" \
+            --set-string "services.loyalty-service.image=tsardrobovik/loyalty-service:4@$LOYALTY_DIGEST" \
+            --set-string "services.payment-service.image=tsardrobovik/payment-service:4@$PAYMENT_DIGEST" \
+            --set-string "services.reservation-service.image=tsardrobovik/reservation-service:4@$RESERVATION_DIGEST" \
+            --wait --atomic --timeout 10m
+          # Helm rolls out changed image digests; do not restart all Pods a second time.
           for service in gateway loyalty-service payment-service reservation-service; do
-            kubectl rollout status "deployment/$service" -n "$NAMESPACE" --timeout=3m
+            kubectl rollout status "deployment/$service" -n "$NAMESPACE" --timeout=5m
           done
           kubectl apply -f k8s/ingress.yaml
 
@@ -246,12 +264,20 @@ jobs:
           echo "::error::The original API test scenario failed."
           exit 1
 
+      - name: Diagnose Kubernetes failure
+        if: failure() && steps.kubeconfig.outcome == 'success'
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          kubectl get deployments,statefulsets,pods,pvc -n "$NAMESPACE" -o wide
+          kubectl get events -n "$NAMESPACE" --sort-by=.metadata.creationTimestamp | tail -n 60
+
       - name: Restore loyalty after API tests
-        if: always() && steps.kubeconfig.outcome == 'success'
-        timeout-minutes: 4
+        if: always() && steps.kubeconfig.outcome == 'success' && steps.autograding.outcome != 'skipped'
+        timeout-minutes: 6
         run: |
           kubectl scale deployment loyalty-service -n "$NAMESPACE" --replicas=1
-          kubectl rollout status deployment/loyalty-service -n "$NAMESPACE" --timeout=3m
+          kubectl rollout status deployment/loyalty-service -n "$NAMESPACE" --timeout=5m
 
       - name: Remove temporary Kubernetes API access
         if: always() && steps.yc.outcome == 'success' && steps.allow_runner.outcome != 'skipped'
