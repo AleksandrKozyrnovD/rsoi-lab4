@@ -15,6 +15,9 @@ jobs:
   build:
     name: Autograding
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     env:
       YC_CLUSTER_ID: ${{ vars.YC_CLUSTER_ID }}
       YC_MASTER_SECURITY_GROUP_ID: ${{ vars.YC_MASTER_SECURITY_GROUP_ID }}
@@ -173,6 +176,12 @@ jobs:
             --exec-command=yc --exec-arg=--config --exec-arg="$YC_CONFIG" \
             --exec-arg=managed-kubernetes --exec-arg=create-token
           kubectl get deployments -n "$NAMESPACE"
+          # Classroom forwards HOME and PATH, but drops KUBECONFIG and YC_CONFIG.
+          # Its kubectl must find the same exec-auth config at the default path.
+          mkdir -p "$HOME/.kube"
+          install -m 600 "$KUBECONFIG" "$HOME/.kube/config"
+          env -i HOME="$HOME" PATH="$PATH" \
+            kubectl get deployment loyalty-service -n "$NAMESPACE"
 
       - name: Deploy postgres
         if: github.event_name == 'push'
@@ -315,4 +324,6 @@ jobs:
 
       - name: Remove local credentials
         if: always()
-        run: rm -rf "$RUNNER_TEMP/yc"
+        run: |
+          rm -f "$HOME/.kube/config"
+          rm -rf "$RUNNER_TEMP/yc"
