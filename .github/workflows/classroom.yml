@@ -6,10 +6,19 @@ on:
   pull_request:
     branches:
       - master
+# The shared cluster and mutable :4 tags must not be used by concurrent runs.
+concurrency:
+  group: rsoi-lab4
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Autograding
     runs-on: ubuntu-latest
+    env:
+      YC_CLUSTER_ID: ${{ vars.YC_CLUSTER_ID }}
+      YC_MASTER_SECURITY_GROUP_ID: ${{ vars.YC_MASTER_SECURITY_GROUP_ID }}
+      NAMESPACE: test
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,6 +44,10 @@ jobs:
       - name: Run unit tests reservation
         working-directory: ./project/reservation-service
         run: go test -v -short ./service/...
+
+      - name: Run unit tests gateway
+        working-directory: ./project/gateway
+        run: go test -v -short ./...
 
       - name: Log in to Docker Hub
         if: github.event_name == 'push'
@@ -79,13 +92,201 @@ jobs:
           push: true
           tags: tsardrobovik/reservation-service:4
 
-      # TODO deploy to k8s with liveness and readyness probes
+      - name: Set up Yandex Cloud CLI
+        id: yc
+        if: github.event_name == 'push'
+        timeout-minutes: 5
+        env:
+          YC_SA_KEY: ${{ secrets.YC_SA_KEY }}
+        run: |
+          : "${YC_CLUSTER_ID:?Set repository variable YC_CLUSTER_ID}"
+          : "${YC_MASTER_SECURITY_GROUP_ID:?Set repository variable YC_MASTER_SECURITY_GROUP_ID}"
+          : "${YC_SA_KEY:?Set repository secret YC_SA_KEY}"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/yc/bin"
+          curl --fail --location --retry 3 \
+            https://storage.yandexcloud.net/yandexcloud-yc/release/1.44.0/linux/amd64/yc \
+            --output "$RUNNER_TEMP/yc/bin/yc"
+          chmod 700 "$RUNNER_TEMP/yc/bin/yc"
+          printf '%s' "$YC_SA_KEY" > "$RUNNER_TEMP/yc/key.json"
+          "$RUNNER_TEMP/yc/bin/yc" --config "$RUNNER_TEMP/yc/config.yaml" \
+            config set service-account-key "$RUNNER_TEMP/yc/key.json"
+          echo "$RUNNER_TEMP/yc/bin" >> "$GITHUB_PATH"
+          echo "YC_CONFIG=$RUNNER_TEMP/yc/config.yaml" >> "$GITHUB_ENV"
+
+      - name: Start Kubernetes cluster
+        id: start_cluster
+        if: github.event_name == 'push'
+        timeout-minutes: 15
+        run: |
+          status=$(yc --config "$YC_CONFIG" managed-kubernetes cluster get \
+            --id "$YC_CLUSTER_ID" --format json --jq .status)
+          case "$status" in
+            RUNNING) ;;
+            STOPPED) yc --config "$YC_CONFIG" managed-kubernetes cluster start "$YC_CLUSTER_ID" ;;
+            *) echo "::error::Cannot start cluster in state $status"; exit 1 ;;
+          esac
+
+      - name: Allow this runner to reach Kubernetes API
+        id: allow_runner
+        if: github.event_name == 'push'
+        timeout-minutes: 3
+        run: |
+          RUNNER_IP=$(curl --fail --silent --show-error --retry 3 https://api.ipify.org)
+          export RUNNER_IP
+          python3 -c 'import ipaddress, os; ipaddress.IPv4Address(os.environ["RUNNER_IP"])'
+          marker="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          yc --config "$YC_CONFIG" vpc security-group update-rules \
+            --id "$YC_MASTER_SECURITY_GROUP_ID" \
+            --add-rule "description=$marker,direction=ingress,protocol=tcp,port=443,v4-cidrs=[$RUNNER_IP/32]" \
+            --add-rule "description=$marker,direction=ingress,protocol=tcp,port=6443,v4-cidrs=[$RUNNER_IP/32]"
+
+      - name: Set up kubectl
+        if: github.event_name == 'push'
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.13
+
+      - name: Set up Helm
+        if: github.event_name == 'push'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Configure kubeconfig
+        id: kubeconfig
+        if: github.event_name == 'push'
+        timeout-minutes: 7
+        run: |
+          umask 077
+          export KUBECONFIG="$RUNNER_TEMP/yc/kubeconfig.yaml"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          yc --config "$YC_CONFIG" managed-kubernetes cluster get-credentials "$YC_CLUSTER_ID" \
+            --external --kubeconfig "$KUBECONFIG" --context-name rsoi-lab4-ci
+          # Pass the isolated CLI config to kubeconfig's exec authentication too.
+          kube_user=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')
+          kubectl config set-credentials "$kube_user" \
+            --exec-command=yc --exec-arg=--config --exec-arg="$YC_CONFIG" \
+            --exec-arg=managed-kubernetes --exec-arg=create-token
+          kubectl get deployments -n "$NAMESPACE"
+
+      - name: Deploy postgres
+        if: github.event_name == 'push'
+        timeout-minutes: 10
+        env:
+          DB_VALUES: ${{ secrets.DB_VALUES }}
+        run: |
+          : "${DB_VALUES:?Set repository secret DB_VALUES to the existing database credentials YAML}"
+          umask 077
+          printf '%s' "$DB_VALUES" > "$RUNNER_TEMP/yc/database-values.yaml"
+          helm upgrade --install postgres ./k8s/postgres -n "$NAMESPACE" \
+            -f "$RUNNER_TEMP/yc/database-values.yaml" \
+            --set persistence.storageClass=yc-network-hdd \
+            --wait --atomic --timeout 7m
+
+      - name: Deploy services
+        if: github.event_name == 'push'
+        timeout-minutes: 12
+        run: |
+          helm upgrade --install services ./k8s/services -n "$NAMESPACE" \
+            -f "$RUNNER_TEMP/yc/database-values.yaml" --set imagePullPolicy=Always \
+            --wait --atomic --timeout 7m
+          # The tag stays :4; restart even when the rendered Deployment did not change.
+          kubectl rollout restart deployment -n "$NAMESPACE" -l app.kubernetes.io/instance=services
+          for service in gateway loyalty-service payment-service reservation-service; do
+            kubectl rollout status "deployment/$service" -n "$NAMESPACE" --timeout=3m
+          done
+          kubectl apply -f k8s/ingress.yaml
 
       - name: Wait before services are ready
+        if: github.event_name == 'push'
         run: kubectl wait -n test -l app.kubernetes.io/name=gateway pod --for=condition=Ready --timeout 3m
-      
-      # TODO setup parameters in classroom/autograding.json
-      
+
+      - name: Set baseUrl to ingress address
+        if: github.event_name == 'push'
+        timeout-minutes: 5
+        run: |
+          kubectl rollout status deployment/traefik -n ingress-system --timeout=3m
+          IP=$(kubectl get service traefik -n ingress-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          : "${IP:?Ingress controller has no external IP}"
+          export BASE_URL="http://$IP"
+          curl --fail --retry 10 --retry-delay 3 --retry-all-errors --max-time 15 "$BASE_URL/manage/health"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path('v2/postman/environment.json')
+          environment = json.loads(path.read_text())
+          for item in environment['values']:
+              if item['key'] == 'baseUrl':
+                  item['value'] = os.environ['BASE_URL']
+          path.write_text(json.dumps(environment))
+          PY
+
+      - name: Set up Node.js for Newman
+        if: github.event_name == 'push'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Newman
+        if: github.event_name == 'push'
+        run: npm install --global newman@6.2.1
+
       - name: Autograding
+        id: autograding
+        if: github.event_name == 'push'
+        timeout-minutes: 10
         uses: education/autograding@v1
         continue-on-error: true
+
+      - name: Report failed API tests
+        if: always() && steps.autograding.outcome == 'failure'
+        run: |
+          echo "::error::The original API test scenario failed."
+          exit 1
+
+      - name: Restore loyalty after API tests
+        if: always() && steps.kubeconfig.outcome == 'success'
+        timeout-minutes: 4
+        run: |
+          kubectl scale deployment loyalty-service -n "$NAMESPACE" --replicas=1
+          kubectl rollout status deployment/loyalty-service -n "$NAMESPACE" --timeout=3m
+
+      - name: Remove temporary Kubernetes API access
+        if: always() && steps.yc.outcome == 'success' && steps.allow_runner.outcome != 'skipped'
+        timeout-minutes: 3
+        run: |
+          export RULE_MARKER="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rule_ids=$(yc --config "$YC_CONFIG" vpc security-group get \
+            --id "$YC_MASTER_SECURITY_GROUP_ID" --format json | python3 -c \
+            'import json, os, sys; print(",".join(r["id"] for r in json.load(sys.stdin).get("rules", []) if r.get("description") == os.environ["RULE_MARKER"]))')
+          if [ -n "$rule_ids" ]; then
+            yc --config "$YC_CONFIG" vpc security-group update-rules \
+              --id "$YC_MASTER_SECURITY_GROUP_ID" --delete-rule-id "$rule_ids"
+          fi
+
+      - name: Stop Kubernetes cluster
+        if: always() && steps.yc.outcome == 'success'
+        timeout-minutes: 20
+        run: |
+          # A timed-out start can still be running in the cloud. Wait before stopping.
+          for attempt in $(seq 1 40); do
+            status=$(yc --config "$YC_CONFIG" managed-kubernetes cluster get \
+              --id "$YC_CLUSTER_ID" --format json --jq .status)
+            case "$status" in
+              STOPPED) exit 0 ;;
+              RUNNING)
+                yc --config "$YC_CONFIG" managed-kubernetes cluster stop "$YC_CLUSTER_ID"
+                exit 0
+                ;;
+              STARTING|STOPPING) sleep 15 ;;
+              *) echo "::error::Cannot stop cluster in state $status"; exit 1 ;;
+            esac
+          done
+          echo "::error::Cluster did not reach a stoppable state; stop it manually."
+          exit 1
+
+      - name: Remove local credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/yc"
