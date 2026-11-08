@@ -232,7 +232,11 @@ func (a *V1) HandleGetMe(c *gin.Context) {
 	loyalty, err = a.getLoyalty(username)
 	if err != nil {
 		if errors.Is(err, ErrServiceUnavailable) {
-			loyalty = nil // пусто, но 200
+			c.JSON(http.StatusOK, gin.H{
+				"reservations": reservations,
+				"loyalty":      gin.H{},
+			})
+			return
 		} else {
 			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: err.Error()})
 			return
