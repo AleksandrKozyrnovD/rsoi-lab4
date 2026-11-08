@@ -1,0 +1,17 @@
+image: postgres:16-alpine
+auth:
+  adminPassword: ""
+  loyaltyPassword: ""
+  paymentPassword: ""
+  reservationPassword: ""
+persistence:
+  size: 5Gi
+  # Empty uses the cluster's default StorageClass.
+  storageClass: ""
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

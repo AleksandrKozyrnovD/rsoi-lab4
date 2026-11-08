@@ -1,0 +1,6 @@
+apiVersion: v2
+name: postgres
+description: Single PostgreSQL instance with isolated databases for RSOI v2
+type: application
+version: 0.1.0
+appVersion: "16"

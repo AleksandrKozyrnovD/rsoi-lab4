@@ -1,0 +1,57 @@
+# A single release deploys all services using the same templates.
+replicaCount: 1
+imagePullPolicy: IfNotPresent
+imagePullSecrets: []
+database:
+  host: postgres
+  port: 5432
+# Supply the same private credentials file as for k8s/postgres/.
+# See k8s/postgres/credentials.example.yaml.
+# Only the matching password is mounted in each backend service.
+auth: {}
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+healthPath: /manage/health
+
+services:
+  gateway:
+    image: tsardrobovik/gateway-service:4
+    port: 8080
+    database:
+      enabled: false
+    upstreams:
+      loyalty: http://loyalty-service:8050
+      payment: http://payment-service:8060
+      reservation: http://reservation-service:8070
+
+  loyalty-service:
+    image: tsardrobovik/loyalty-service:4
+    port: 8050
+    database:
+      enabled: true
+      name: loyalties
+      username: loyalty
+      password: ""
+
+  payment-service:
+    image: tsardrobovik/payment-service:4
+    port: 8060
+    database:
+      enabled: true
+      name: payments
+      username: payment
+      password: ""
+
+  reservation-service:
+    image: tsardrobovik/reservation-service:4
+    port: 8070
+    database:
+      enabled: true
+      name: reservations
+      username: reservation
+      password: ""

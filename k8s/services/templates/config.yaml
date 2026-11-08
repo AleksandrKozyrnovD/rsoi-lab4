@@ -1,0 +1,30 @@
+{{- range $name, $service := .Values.services }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-config
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+type: Opaque
+stringData:
+  config.yml: |
+    http:
+      host: "0.0.0.0"
+      port: {{ $service.port }}
+    {{- if $service.database.enabled }}
+    database:
+      driver: postgres
+      postgres:
+        host: {{ $.Values.database.host | quote }}
+        port: {{ $.Values.database.port }}
+        user: {{ required (printf "%s: database.username is required" $name) $service.database.username | quote }}
+        password: {{ required (printf "%s: set database.password or the corresponding auth.*Password" $name) ($service.database.password | default (get $.Values.auth (printf "%sPassword" $service.database.username))) | quote }}
+        database: {{ required (printf "%s: database.name is required" $name) $service.database.name | quote }}
+    {{- end }}
+    {{- with $service.upstreams }}
+    url:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,27 @@
+# Apply after deploying gateway into the same namespace.
+# An Ingress Controller with class nginx must already be installed in the cluster.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway
+  namespace: test
+spec:
+  ingressClassName: nginx
+  # For HTTPS create the TLS Secret in namespace test and uncomment:
+  # tls:
+  #   - secretName: booking-tls
+  #     hosts:
+  #       - booking.example.com
+  rules:
+    # Without host the rule accepts requests to the controller's external IP.
+    # For a domain, uncomment host and point DNS to the controller's address.
+    - # host: booking.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080

@@ -1,0 +1,84 @@
+{{- $configChecksum := include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+{{- range $name, $service := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+spec:
+  replicas: {{ dig "replicaCount" $.Values.replicaCount $service }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+      annotations:
+        checksum/config: {{ $configChecksum }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: {{ required (printf "%s: image is required" $name) $service.image | quote }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          workingDir: /app
+          env:
+            - name: GIN_MODE
+              value: release
+          ports:
+            - name: http
+              containerPort: {{ $service.port }}
+          startupProbe:
+            httpGet:
+              path: {{ $.Values.healthPath }}
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: {{ $.Values.healthPath }}
+              port: http
+            periodSeconds: 3
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: {{ $.Values.healthPath }}
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml ($service.resources | default $.Values.resources) | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yml
+              subPath: config.yml
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ $name }}-config
+            defaultMode: 0440
+{{- end }}
